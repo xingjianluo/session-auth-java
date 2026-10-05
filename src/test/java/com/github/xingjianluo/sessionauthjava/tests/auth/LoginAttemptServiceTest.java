@@ -2,6 +2,8 @@ package com.github.xingjianluo.sessionauthjava.tests.auth;
 
 import com.github.xingjianluo.sessionauthjava.auth.config.AuthSecurityProperties;
 import com.github.xingjianluo.sessionauthjava.auth.model.AuthFailureReason;
+import com.github.xingjianluo.sessionauthjava.auth.policy.DecisionLog;
+import com.github.xingjianluo.sessionauthjava.auth.policy.PolicyService;
 import com.github.xingjianluo.sessionauthjava.auth.service.LoginAttemptService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -28,6 +30,7 @@ class LoginAttemptServiceTest {
 
     private MutableClock clock;
     private AuthSecurityProperties properties;
+    private PolicyService policyService;
     private LoginAttemptService service;
 
     @BeforeEach
@@ -38,7 +41,8 @@ class LoginAttemptServiceTest {
         properties.setLockDuration(Duration.ofMinutes(5));
         properties.setRateLimitWindow(Duration.ofMinutes(1));
         properties.setRateLimitMaxAttempts(5);
-        service = new LoginAttemptService(properties, clock);
+        policyService = new PolicyService(properties);
+        service = new LoginAttemptService(policyService, new DecisionLog(policyService), clock);
     }
 
     @Test
@@ -71,8 +75,8 @@ class LoginAttemptServiceTest {
     @Test
     void rateLimitsWhenWindowAttemptsExceeded() {
         String user = "erin";
-        // 连续失败上限 3 会触发锁定；为单独验证限流，把锁定阈值调高
-        properties.setMaxFailedAttempts(100);
+        // 连续失败上限 3 会触发锁定；为单独验证限流，运行期把锁定阈值调高（发布新策略版本）
+        policyService.update(p -> p.setMaxFailedAttempts(100));
         for (int i = 0; i < 5; i++) {
             service.recordFailure(user);
         }
@@ -101,8 +105,11 @@ class LoginAttemptServiceTest {
     @Test
     void concurrentFailuresNeverLoseCount() throws InterruptedException {
         String user = "grace";
-        properties.setMaxFailedAttempts(100_000); // 关闭锁定干扰，单独验证限流计数
-        properties.setRateLimitMaxAttempts(1000);
+        // 运行期调整策略：关闭锁定干扰、放大限流上限，单独验证限流计数
+        policyService.update(p -> {
+            p.setMaxFailedAttempts(100_000);
+            p.setRateLimitMaxAttempts(1000);
+        });
         int threads = 16;
         int failuresPerThread = 50;
         ExecutorService pool = Executors.newFixedThreadPool(threads);

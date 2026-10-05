@@ -65,7 +65,7 @@ class SessionServiceTest {
         boolean secondLogout = service.logout(sessionId);
         log.info("[test] input=logout twice, firstValidate={} secondLogout={}", first, secondLogout);
         AuthResult.Failure failure = assertInstanceOf(AuthResult.Failure.class, first);
-        assertEquals(AuthFailureReason.SESSION_NOT_FOUND, failure.reason());
+        assertEquals(AuthFailureReason.SESSION_LOGGED_OUT, failure.reason());
         assertTrue(!secondLogout, "重复登出不得再次放行");
     }
 
