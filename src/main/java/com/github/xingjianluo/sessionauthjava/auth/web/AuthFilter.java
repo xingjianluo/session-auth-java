@@ -1,8 +1,12 @@
 package com.github.xingjianluo.sessionauthjava.auth.web;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.github.xingjianluo.sessionauthjava.auth.config.AuthSecurityProperties;
 import com.github.xingjianluo.sessionauthjava.auth.model.AuthResult;
+import com.github.xingjianluo.sessionauthjava.auth.policy.DecisionLog;
+import com.github.xingjianluo.sessionauthjava.auth.policy.DecisionTypes;
+import com.github.xingjianluo.sessionauthjava.auth.policy.PolicyDecisions;
+import com.github.xingjianluo.sessionauthjava.auth.policy.PolicyService;
+import com.github.xingjianluo.sessionauthjava.auth.policy.PolicySnapshot;
 import com.github.xingjianluo.sessionauthjava.auth.service.AccessControlService;
 import com.github.xingjianluo.sessionauthjava.auth.service.SessionService;
 import jakarta.servlet.FilterChain;
@@ -13,19 +17,20 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
-import org.springframework.util.AntPathMatcher;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 
 /**
  * 认证过滤器：
  * <ul>
- *   <li>公开路径（配置项）直接放行，绝不误拦截</li>
+ *   <li>公开路径（策略快照中的 publicPaths）直接放行，绝不误拦截</li>
  *   <li>受保护路径校验 X-Session-Id，失败返回 401 且原因可区分</li>
  *   <li>校验通过将会话挂到请求属性，供后续过滤器与控制器使用</li>
  * </ul>
+ * 公开路径判定写入判定日志并标注策略版本，支持历史回放。
  */
 @Component
 public class AuthFilter extends OncePerRequestFilter {
@@ -37,32 +42,33 @@ public class AuthFilter extends OncePerRequestFilter {
 
     private final SessionService sessionService;
     private final AccessControlService accessControlService;
-    private final AuthSecurityProperties properties;
-    private final AntPathMatcher pathMatcher = new AntPathMatcher();
+    private final PolicyService policyService;
+    private final DecisionLog decisionLog;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     public AuthFilter(SessionService sessionService, AccessControlService accessControlService,
-                      AuthSecurityProperties properties) {
+                      PolicyService policyService, DecisionLog decisionLog) {
         this.sessionService = sessionService;
         this.accessControlService = accessControlService;
-        this.properties = properties;
+        this.policyService = policyService;
+        this.decisionLog = decisionLog;
     }
 
+    /** 按当前生效策略判定路径是否公开 */
     public boolean isPublicPath(String path) {
-        for (String pattern : properties.getPublicPaths()) {
-            if (pathMatcher.match(pattern, path)) {
-                return true;
-            }
-        }
-        return false;
+        return PolicyDecisions.isPublicPath(path, policyService.current().settings());
     }
 
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
                                     FilterChain filterChain) throws ServletException, IOException {
         String path = request.getRequestURI();
-        if (isPublicPath(path)) {
-            log.info("[auth-filter] path={} is public -> skip auth", path);
+        PolicySnapshot snapshot = policyService.current();
+        boolean isPublic = PolicyDecisions.isPublicPath(path, snapshot.settings());
+        decisionLog.record(DecisionTypes.PUBLIC_PATH, snapshot.version(),
+                Map.of("path", path), isPublic ? "PUBLIC" : "PROTECTED");
+        if (isPublic) {
+            log.info("[auth-filter] path={} is public -> skip auth (policy v{})", path, snapshot.version());
             filterChain.doFilter(request, response);
             return;
         }

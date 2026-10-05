@@ -2,6 +2,13 @@ package com.github.xingjianluo.sessionauthjava.auth.service;
 
 import com.github.xingjianluo.sessionauthjava.auth.config.AuthSecurityProperties;
 import com.github.xingjianluo.sessionauthjava.auth.model.AuthFailureReason;
+import com.github.xingjianluo.sessionauthjava.auth.policy.DecisionLog;
+import com.github.xingjianluo.sessionauthjava.auth.policy.DecisionTypes;
+import com.github.xingjianluo.sessionauthjava.auth.policy.PolicyDecisions;
+import com.github.xingjianluo.sessionauthjava.auth.policy.PolicyReplayService;
+import com.github.xingjianluo.sessionauthjava.auth.policy.PolicyService;
+import com.github.xingjianluo.sessionauthjava.auth.policy.PolicySettings;
+import com.github.xingjianluo.sessionauthjava.auth.policy.PolicySnapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -9,7 +16,9 @@ import org.springframework.stereotype.Service;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -22,25 +31,34 @@ import java.util.concurrent.ConcurrentHashMap;
  *   <li>锁定：连续失败次数达到上限 -> 锁定一段时间，期间返回 {@link AuthFailureReason#ACCOUNT_LOCKED}</li>
  *   <li>登录成功清除全部失败状态</li>
  * </ul>
- * 判定只依赖调用时刻生效的配置快照，保证配置变更前历史判定可复现。
+ * 判定结论由 {@link PolicyDecisions#checkBlocked} 纯函数给出（与历史回放共用），
+ * 判定只依赖调用时刻生效的策略快照，并写入 {@link DecisionLog} 标注策略版本。
  */
 @Service
 public class LoginAttemptService {
 
     private static final Logger log = LoggerFactory.getLogger(LoginAttemptService.class);
 
-    private final AuthSecurityProperties properties;
+    private final PolicyService policyService;
+    private final DecisionLog decisionLog;
     private final Clock clock;
     private final ConcurrentHashMap<String, AttemptState> states = new ConcurrentHashMap<>();
 
     @org.springframework.beans.factory.annotation.Autowired
-    public LoginAttemptService(AuthSecurityProperties properties) {
-        this(properties, Clock.systemUTC());
+    public LoginAttemptService(AuthSecurityProperties properties, PolicyService policyService,
+                               DecisionLog decisionLog) {
+        this(policyService, decisionLog, Clock.systemUTC());
     }
 
-    /** 测试可注入固定时钟 */
+    /** 测试可注入固定时钟（沿用旧签名，策略与判定日志用默认实例） */
     public LoginAttemptService(AuthSecurityProperties properties, Clock clock) {
-        this.properties = properties;
+        this(new PolicyService(properties), new DecisionLog(), clock);
+    }
+
+    /** 测试可注入共享的策略服务/判定日志与固定时钟 */
+    public LoginAttemptService(PolicyService policyService, DecisionLog decisionLog, Clock clock) {
+        this.policyService = policyService;
+        this.decisionLog = decisionLog;
         this.clock = clock;
     }
 
@@ -62,24 +80,27 @@ public class LoginAttemptService {
             return Optional.empty();
         }
         synchronized (state) {
+            PolicySnapshot snapshot = policyService.current();
             Instant now = clock.instant();
-            if (state.lockedUntil != null) {
-                if (now.isBefore(state.lockedUntil)) {
-                    log.info("[login-attempt] user={} blocked reason=ACCOUNT_LOCKED lockedUntil={}",
-                            username, state.lockedUntil);
-                    return Optional.of(AuthFailureReason.ACCOUNT_LOCKED);
-                }
-                // 锁定期满，重置锁定与连续计数
+            // 锁定期满的 bookkeeping：重置锁定与连续计数（不影响本次判定结论）
+            if (state.lockedUntil != null && !now.isBefore(state.lockedUntil)) {
                 state.lockedUntil = null;
                 state.consecutiveFailures = 0;
             }
-            pruneWindow(state, now);
-            if (state.failuresInWindow.size() >= properties.getRateLimitMaxAttempts()) {
-                log.info("[login-attempt] user={} blocked reason=RATE_LIMITED failuresInWindow={} max={}",
-                        username, state.failuresInWindow.size(), properties.getRateLimitMaxAttempts());
-                return Optional.of(AuthFailureReason.RATE_LIMITED);
+            pruneWindow(state, now, snapshot.settings());
+            Optional<AuthFailureReason> blocked = PolicyDecisions.checkBlocked(
+                    new ArrayList<>(state.failuresInWindow), state.lockedUntil, now, snapshot.settings());
+            decisionLog.record(DecisionTypes.LOGIN_BLOCKED, snapshot.version(), Map.of(
+                    "username", username,
+                    "failures", PolicyReplayService.joinInstants(state.failuresInWindow),
+                    "lockedUntil", state.lockedUntil == null ? "" : state.lockedUntil.toString(),
+                    "now", now.toString()),
+                    blocked.map(Enum::name).orElse("OK"));
+            if (blocked.isPresent()) {
+                log.info("[login-attempt] user={} blocked reason={} (policy v{})",
+                        username, blocked.get(), snapshot.version());
             }
-            return Optional.empty();
+            return blocked;
         }
     }
 
@@ -89,16 +110,17 @@ public class LoginAttemptService {
     public void recordFailure(String username) {
         AttemptState state = states.computeIfAbsent(username, k -> new AttemptState());
         synchronized (state) {
+            PolicySettings settings = policyService.current().settings();
             Instant now = clock.instant();
-            pruneWindow(state, now);
+            pruneWindow(state, now, settings);
             state.failuresInWindow.addLast(now);
             state.consecutiveFailures++;
             log.info("[login-attempt] user={} failure recorded consecutive={} inWindow={}",
                     username, state.consecutiveFailures, state.failuresInWindow.size());
-            if (state.consecutiveFailures >= properties.getMaxFailedAttempts()) {
-                state.lockedUntil = now.plus(properties.getLockDuration());
+            if (state.consecutiveFailures >= settings.maxFailedAttempts()) {
+                state.lockedUntil = now.plus(settings.lockDuration());
                 log.info("[login-attempt] user={} LOCKED until={} (consecutive={} >= max={})",
-                        username, state.lockedUntil, state.consecutiveFailures, properties.getMaxFailedAttempts());
+                        username, state.lockedUntil, state.consecutiveFailures, settings.maxFailedAttempts());
             }
         }
     }
@@ -118,8 +140,8 @@ public class LoginAttemptService {
         }
     }
 
-    private void pruneWindow(AttemptState state, Instant now) {
-        Instant cutoff = now.minus(properties.getRateLimitWindow());
+    private void pruneWindow(AttemptState state, Instant now, PolicySettings settings) {
+        Instant cutoff = now.minus(settings.rateLimitWindow());
         while (!state.failuresInWindow.isEmpty() && state.failuresInWindow.peekFirst().isBefore(cutoff)) {
             state.failuresInWindow.pollFirst();
         }

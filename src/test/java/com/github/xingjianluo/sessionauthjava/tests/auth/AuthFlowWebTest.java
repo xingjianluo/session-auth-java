@@ -100,7 +100,7 @@ class AuthFlowWebTest {
 
         MvcResult after = mockMvc.perform(get("/api/user/profile").header("X-Session-Id", sessionId))
                 .andExpect(status().isUnauthorized())
-                .andExpect(jsonPath("$.reason").value("SESSION_NOT_FOUND"))
+                .andExpect(jsonPath("$.reason").value("SESSION_LOGGED_OUT"))
                 .andReturn();
         log.info("[test] input=reuse session after logout -> 401 body={}",
                 after.getResponse().getContentAsString());
