@@ -27,7 +27,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>失效语义可区分且各入口一致：
  * <ul>
- *   <li>从未存在/保留期外：{@link AuthFailureReason#SESSION_UNKNOWN}</li>
+ *   <li>从未存在/保留期外：{@link AuthFailureReason#SESSION_NOT_FOUND}</li>
  *   <li>主动登出：{@link AuthFailureReason#SESSION_LOGGED_OUT}（登出时写入墓碑，
  *       重复登出、登出后再访问结论一致）</li>
  *   <li>过期：{@link AuthFailureReason#SESSION_EXPIRED}（记录保留）</li>
@@ -35,9 +35,18 @@ import java.util.concurrent.ConcurrentHashMap;
  *       撤销优先于过期——一旦撤销，无论是否过期都返回 REVOKED）</li>
  * </ul>
  *
- * <p>叠加状态的稳定优先级：REVOKED &gt; LOGGED_OUT &gt; EXPIRED &gt; UNKNOWN。
- * 失效记录（过期会话与登出墓碑）保留一个会话时长后清理，之后按 UNKNOWN 处理，
+ * <p>叠加状态的稳定优先级：REVOKED &gt; LOGGED_OUT &gt; EXPIRED &gt; NOT_FOUND。
+ * 失效记录（过期会话与登出墓碑）保留一个会话时长后清理，之后按 NOT_FOUND 处理，
  * 保证长时间运行占用有界。
+ *
+ * <p>"活动记录 + 墓碑"由同一把 {@code tombstones} 锁保护状态迁移，保证：
+ * <ul>
+ *   <li>登出（写墓碑 + 移除活动记录）原子：并发校验只会看到"有效"或 LOGGED_OUT，
+ *       绝不会在两者之间落回 NOT_FOUND；</li>
+ *   <li>撤销用户时同时把该用户已有墓碑升级为 REVOKED：已登出又被强制失效
+ *       稳定为 REVOKED（撤销优先），结论与操作先后顺序无关；</li>
+ *   <li>重复登出恰好一次真实生效，第二次起返回 false 且原因稳定。</li>
+ * </ul>
  *
  * <p>并发签发按用户加锁，不会超过并发会话上限，也不会重复放行。
  */
@@ -59,7 +68,8 @@ public class SessionService {
     private final ConcurrentHashMap<String, Object> issueLocks = new ConcurrentHashMap<>();
     private final SecureRandom random = new SecureRandom();
 
-    private record Tombstone(AuthFailureReason reason, Instant purgeAt) {
+    /** 登出墓碑：归属用户、终态原因与清理时刻（插入序，容量受控） */
+    private record Tombstone(String username, AuthFailureReason reason, Instant purgeAt) {
     }
 
     @org.springframework.beans.factory.annotation.Autowired
@@ -91,8 +101,8 @@ public class SessionService {
         Instant now = clock.instant();
         prune(now, policy);
         if (sessionId == null || sessionId.isBlank()) {
-            log.info("[session] validate: missing session id -> SESSION_UNKNOWN (policyVersion={})", policy.version());
-            return AuthResult.failure(AuthFailureReason.SESSION_UNKNOWN, "no session id provided");
+            log.info("[session] validate: missing session id -> SESSION_NOT_FOUND (policyVersion={})", policy.version());
+            return AuthResult.failure(AuthFailureReason.SESSION_NOT_FOUND, "no session id provided");
         }
         SessionRecord record = sessions.get(sessionId);
         if (record != null) {
@@ -117,8 +127,8 @@ public class SessionService {
             log.info("[session] validate: id={} -> {} (tombstone)", abbrev(sessionId), tombstone.reason());
             return AuthResult.failure(tombstone.reason(), "session terminated: " + tombstone.reason());
         }
-        log.info("[session] validate: id={} unknown -> SESSION_UNKNOWN", abbrev(sessionId));
-        return AuthResult.failure(AuthFailureReason.SESSION_UNKNOWN, "session never existed or was purged");
+        log.info("[session] validate: id={} unknown -> SESSION_NOT_FOUND", abbrev(sessionId));
+        return AuthResult.failure(AuthFailureReason.SESSION_NOT_FOUND, "session never existed or was purged");
     }
 
     /**
@@ -155,51 +165,68 @@ public class SessionService {
     }
 
     /**
-     * 主动登出：写入墓碑（先）再移除记录（后），保证并发校验要么看到有效会话、
-     * 要么看到 LOGGED_OUT，不会落回 UNKNOWN。重复登出返回 false 且原因保持
-     * LOGGED_OUT 不变；已撤销会话登出后仍保持 REVOKED。
+     * 主动登出：在同一把锁内完成"写墓碑 + 移除活动记录"，保证并发校验要么看到
+     * 有效会话、要么看到 LOGGED_OUT，不会落回 NOT_FOUND。重复登出返回 false 且
+     * 原因保持 LOGGED_OUT 不变；已撤销会话登出后仍保持 REVOKED（撤销优先）。
      *
-     * @return 是否真实登出了一个存在的会话
+     * @return 是否真实登出了一个存在的活动会话
      */
     public boolean logout(String sessionId) {
         AuthPolicy policy = policyService.current();
         Instant now = clock.instant();
-        SessionRecord record = sessions.get(sessionId);
-        if (record == null) {
-            boolean known;
-            synchronized (tombstones) {
-                known = tombstones.containsKey(sessionId);
-            }
-            log.info("[session] logout: id={} no live session (tombstoneKnown={}) -> false",
-                    abbrev(sessionId), known);
-            return false;
-        }
-        // 已撤销的会话登出后仍报 REVOKED（撤销优先），否则报 LOGGED_OUT
-        AuthFailureReason reason = record.isRevoked()
-                ? AuthFailureReason.SESSION_REVOKED : AuthFailureReason.SESSION_LOGGED_OUT;
         synchronized (tombstones) {
-            tombstones.putIfAbsent(sessionId, new Tombstone(reason, now.plus(policy.sessionTtl())));
+            pruneTombstones(now);
+            SessionRecord record = sessions.get(sessionId);
+            if (record == null) {
+                // 活动记录已不存在：墓碑存在说明是重复登出（原因维持首次终态不变），
+                // 墓碑也不存在则可能是从未登录/已过保留期 -> false
+                Tombstone existing = tombstones.get(sessionId);
+                log.info("[session] logout: id={} no live session (tombstoneKnown={}) -> false",
+                        abbrev(sessionId), existing != null);
+                return false;
+            }
+            // 已撤销的会话登出后仍报 REVOKED（撤销优先），否则报 LOGGED_OUT
+            AuthFailureReason reason = record.isRevoked()
+                    ? AuthFailureReason.SESSION_REVOKED : AuthFailureReason.SESSION_LOGGED_OUT;
+            tombstones.putIfAbsent(sessionId,
+                    new Tombstone(record.username(), reason, now.plus(policy.sessionTtl())));
             evictTombstonesIfNeeded();
+            sessions.remove(sessionId);
+            log.info("[session] logout: id={} user={} tombstone={} removed=true",
+                    abbrev(sessionId), record.username(), reason);
+            return true;
         }
-        SessionRecord removed = sessions.remove(sessionId);
-        log.info("[session] logout: id={} user={} tombstone={} removed={}",
-                abbrev(sessionId), record.username(), reason, removed != null);
-        return removed != null;
     }
 
     /**
-     * 强制失效某用户全部会话（管理员强制下线/降权触发），返回新撤销数量。
-     * 已过期的会话也一并标记，保证"过期+被强制失效"的叠加状态稳定返回 REVOKED。
+     * 强制失效某用户全部会话（管理员强制下线/降权触发），返回新撤销的活动会话数量。
+     * 在统一状态锁内同时：
+     * <ul>
+     *   <li>标记活动记录（含已过期记录）撤销——"过期+被强制失效"稳定返回 REVOKED；</li>
+     *   <li>把该用户已有的登出墓碑升级为 REVOKED——"登出后又被强制失效"也稳定为
+     *       REVOKED，结论与操作先后顺序无关。</li>
+     * </ul>
      */
     public int revokeAllForUser(String username) {
         int count = 0;
-        for (SessionRecord record : sessions.values()) {
-            if (record.username().equals(username) && !record.isRevoked()) {
-                record.revoke();
-                count++;
+        synchronized (tombstones) {
+            for (SessionRecord record : sessions.values()) {
+                if (record.username().equals(username) && !record.isRevoked()) {
+                    record.revoke();
+                    count++;
+                }
             }
+            int upgraded = 0;
+            for (Map.Entry<String, Tombstone> entry : tombstones.entrySet()) {
+                Tombstone t = entry.getValue();
+                if (t.username().equals(username) && t.reason() != AuthFailureReason.SESSION_REVOKED) {
+                    entry.setValue(new Tombstone(t.username(), AuthFailureReason.SESSION_REVOKED, t.purgeAt()));
+                    upgraded++;
+                }
+            }
+            log.info("[session] revokeAllForUser: user={} revokedLive={} upgradedTombstones={}",
+                    username, count, upgraded);
         }
-        log.info("[session] revokeAllForUser: user={} revoked={}", username, count);
         return count;
     }
 
@@ -239,15 +266,21 @@ public class SessionService {
 
     /**
      * 清理失效记录：过期超过一个会话时长的会话记录、到期的登出墓碑。
-     * 保留期内历史原因（EXPIRED/LOGGED_OUT/REVOKED）稳定可查，清理后归为 UNKNOWN。
+     * 保留期内历史原因（EXPIRED/LOGGED_OUT/REVOKED）稳定可查，清理后归为 NOT_FOUND。
+     * 在状态锁内执行，与登出/撤销互斥。
      */
     private void prune(Instant now, AuthPolicy policy) {
         java.time.Duration retention = policy.sessionTtl();
-        sessions.values().removeIf(r -> now.isAfter(r.expiresAt().plus(retention)));
         synchronized (tombstones) {
-            tombstones.values().removeIf(t -> now.isAfter(t.purgeAt()));
-            evictTombstonesIfNeeded();
+            sessions.values().removeIf(r -> now.isAfter(r.expiresAt().plus(retention)));
+            pruneTombstones(now);
         }
+    }
+
+    /** 清理到期墓碑并按容量淘汰最旧；调用方必须持有 tombstones 锁。 */
+    private void pruneTombstones(Instant now) {
+        tombstones.values().removeIf(t -> now.isAfter(t.purgeAt()));
+        evictTombstonesIfNeeded();
     }
 
     private void evictTombstonesIfNeeded() {

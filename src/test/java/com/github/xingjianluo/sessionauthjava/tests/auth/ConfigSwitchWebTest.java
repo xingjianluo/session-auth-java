@@ -87,7 +87,7 @@ class ConfigSwitchWebTest {
     void protectedPathStillRequiresSessionUnderNewConfig() throws Exception {
         MvcResult result = mockMvc.perform(get("/api/user/profile"))
                 .andExpect(status().isUnauthorized())
-                .andExpect(jsonPath("$.reason").value("SESSION_UNKNOWN"))
+                .andExpect(jsonPath("$.reason").value("SESSION_NOT_FOUND"))
                 .andReturn();
         log.info("[test] config switched, input=GET /api/user/profile without session -> 401 body={}",
                 result.getResponse().getContentAsString());

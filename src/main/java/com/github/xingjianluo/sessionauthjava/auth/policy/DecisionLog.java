@@ -66,19 +66,38 @@ public class DecisionLog {
         return id;
     }
 
+    /** 按编号取原始判定记录（运维查询用）；已被淘汰返回空。 */
+    public Optional<DecisionRecord> find(long decisionId) {
+        synchronized (this) {
+            return Optional.ofNullable(records.get(decisionId));
+        }
+    }
+
+    /** 当前保留的判定记录，按编号升序（运维列表用，有界拷贝）。 */
+    public java.util.List<DecisionRecord> all() {
+        synchronized (this) {
+            return insertionOrder.stream().map(records::get).toList();
+        }
+    }
+
+    /** 回放结果：原记录结论与按当时策略重算的结论（两者一致即回放吻合）。 */
+    public record ReplayResult(DecisionRecord record, String replayedOutcome) {
+        public boolean matches() {
+            return record.outcome().equals(replayedOutcome);
+        }
+    }
+
     /**
-     * 回放历史判定：取记录当时的策略版本与输入重算结论。
+     * 回放历史判定：取记录当时的策略版本与输入重算结论，连同原结论一起返回。
      * 记录或对应策略版本已被淘汰时返回空。
      */
-    public Optional<String> replay(long decisionId) {
-        DecisionRecord record;
-        synchronized (this) {
-            record = records.get(decisionId);
-        }
-        if (record == null) {
+    public Optional<ReplayResult> replayDetailed(long decisionId) {
+        Optional<DecisionRecord> found = find(decisionId);
+        if (found.isEmpty()) {
             log.info("[decision] replay id={} -> record evicted", decisionId);
             return Optional.empty();
         }
+        DecisionRecord record = found.get();
         Optional<AuthPolicy> policy = policyService.version(record.policyVersion());
         if (policy.isEmpty()) {
             log.info("[decision] replay id={} -> policy version={} evicted", decisionId, record.policyVersion());
@@ -87,7 +106,15 @@ public class DecisionLog {
         String outcome = evaluate(record.kind(), policy.get(), record.inputs());
         log.info("[decision] replay id={} kind={} policyVersion={} -> outcome={} (original={})",
                 decisionId, record.kind(), record.policyVersion(), outcome, record.outcome());
-        return Optional.of(outcome);
+        return Optional.of(new ReplayResult(record, outcome));
+    }
+
+    /**
+     * 回放历史判定：取记录当时的策略版本与输入重算结论。
+     * 记录或对应策略版本已被淘汰时返回空。
+     */
+    public Optional<String> replay(long decisionId) {
+        return replayDetailed(decisionId).map(ReplayResult::replayedOutcome);
     }
 
     /** 用指定策略与输入重算某类判定的结论（线上与回放共用）。 */

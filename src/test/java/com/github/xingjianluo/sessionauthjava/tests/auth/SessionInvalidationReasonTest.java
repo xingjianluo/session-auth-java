@@ -68,11 +68,27 @@ class SessionInvalidationReasonTest {
         AuthFailureReason reason = reasonOf("no-such-session-id");
         log.info("[test] business=unknown session, input=validate(never-issued id) -> {}"
                 + " (basis: no live record, no tombstone)", reason);
-        assertEquals(AuthFailureReason.SESSION_UNKNOWN, reason);
+        assertEquals(AuthFailureReason.SESSION_NOT_FOUND, reason);
 
         AuthFailureReason blank = reasonOf("  ");
         log.info("[test] business=missing session id, input=validate(blank) -> {}", blank);
-        assertEquals(AuthFailureReason.SESSION_UNKNOWN, blank);
+        assertEquals(AuthFailureReason.SESSION_NOT_FOUND, blank);
+    }
+
+    @Test
+    void legacyUnknownReasonIdentifierStaysSessionNotFound() {
+        // 兼容性红线：上一轮客户端按 name()=="SESSION_NOT_FOUND" 判断"未知会话"，
+        // 本轮新增 LOGGED_OUT/EXPIRED/REVOKED 只能并存，不得顶替或改名旧标识。
+        AuthFailureReason reason = AuthFailureReason.valueOf("SESSION_NOT_FOUND");
+        log.info("[test] business=legacy identifier compatibility, input=valueOf(SESSION_NOT_FOUND)"
+                + " -> {} (basis: wire identifier must stay byte-for-byte stable)", reason);
+        assertEquals(AuthFailureReason.SESSION_NOT_FOUND, reason);
+        assertEquals("SESSION_NOT_FOUND", reason.name());
+        // 新原因彼此不同且与旧标识并存
+        assertEquals(java.util.Set.of(AuthFailureReason.SESSION_LOGGED_OUT,
+                        AuthFailureReason.SESSION_EXPIRED, AuthFailureReason.SESSION_REVOKED),
+                java.util.EnumSet.of(AuthFailureReason.SESSION_LOGGED_OUT,
+                        AuthFailureReason.SESSION_EXPIRED, AuthFailureReason.SESSION_REVOKED));
     }
 
     @Test
@@ -149,7 +165,7 @@ class SessionInvalidationReasonTest {
         AuthFailureReason reason = reasonOf(id);
         log.info("[test] business=tombstone retention, input=advance 61m after logout -> {}"
                 + " (basis: tombstone purged after one session ttl)", reason);
-        assertEquals(AuthFailureReason.SESSION_UNKNOWN, reason);
+        assertEquals(AuthFailureReason.SESSION_NOT_FOUND, reason);
     }
 
     @Test
@@ -237,5 +253,66 @@ class SessionInvalidationReasonTest {
         assertEquals(1, trues, "并发登下同一会话，恰好一次真实登出");
         assertEquals(AuthFailureReason.SESSION_LOGGED_OUT, reasonOf(id));
         assertEquals(0, service.activeSessionCount(user));
+    }
+
+    @Test
+    void loggedOutThenRevokedReportsRevoked() {
+        String id = issue("u-out-rev");
+        service.logout(id);                     // 先主动登出
+        assertEquals(AuthFailureReason.SESSION_LOGGED_OUT, reasonOf(id));
+        service.revokeAllForUser("u-out-rev");  // 再被管理员强制失效
+        AuthFailureReason reason = reasonOf(id);
+        log.info("[test] business=overlay logout+revoked, input=logout then revoke -> {}"
+                + " (basis: tombstone upgraded, REVOKED has priority over LOGGED_OUT)", reason);
+        assertEquals(AuthFailureReason.SESSION_REVOKED, reason);
+        // 同样输入重复请求，结论固定
+        assertEquals(reason, reasonOf(id));
+    }
+
+    @Test
+    void expiredThenLoggedOutReportsLoggedOut() {
+        // 叠加优先级：LOGGED_OUT > EXPIRED（过期会话仍可被主动登出，登出墓碑生效）
+        String id = issue("u-exp-out");
+        clock.advance(Duration.ofMinutes(31)); // 先过期
+        assertEquals(AuthFailureReason.SESSION_EXPIRED, reasonOf(id));
+        boolean loggedOut = service.logout(id);
+        AuthFailureReason reason = reasonOf(id);
+        log.info("[test] business=overlay expired+logout, input=expire then logout -> loggedOut={} reason={}"
+                + " (basis: LOGGED_OUT has priority over EXPIRED)", loggedOut, reason);
+        assertTrue(loggedOut);
+        assertEquals(AuthFailureReason.SESSION_LOGGED_OUT, reason);
+    }
+
+    @Test
+    void concurrentRevokeAndLogoutSettlesOnRevoked() throws Exception {
+        // 撤销与登出并发：无论交错顺序如何，最终结论固定为 REVOKED（撤销优先），计数为 0
+        for (int iteration = 0; iteration < 20; iteration++) {
+            String user = "u-race-rev-" + iteration;
+            String id = issue(user);
+            ExecutorService pool = Executors.newFixedThreadPool(2);
+            CountDownLatch start = new CountDownLatch(1);
+            Future<?> f1 = pool.submit(() -> {
+                start.await();
+                service.revokeAllForUser(user);
+                return null;
+            });
+            Future<?> f2 = pool.submit(() -> {
+                start.await();
+                service.logout(id);
+                return null;
+            });
+            start.countDown();
+            f1.get(30, TimeUnit.SECONDS);
+            f2.get(30, TimeUnit.SECONDS);
+            pool.shutdown();
+            AuthFailureReason reason = reasonOf(id);
+            assertEquals(AuthFailureReason.SESSION_REVOKED, reason,
+                    "iteration " + iteration + ": revoke+logout 并发落稳后必须为 REVOKED");
+            assertEquals(0, service.activeSessionCount(user));
+            if (iteration == 0) {
+                log.info("[test] business=concurrent revoke+logout, input=20 iterations parallel"
+                        + " -> finalReason={} activeCount=0 (basis: unified state lock, REVOKED wins)", reason);
+            }
+        }
     }
 }
