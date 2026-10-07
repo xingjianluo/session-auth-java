@@ -68,11 +68,26 @@ class SessionInvalidationReasonTest {
         AuthFailureReason reason = reasonOf("no-such-session-id");
         log.info("[test] business=unknown session, input=validate(never-issued id) -> {}"
                 + " (basis: no live record, no tombstone)", reason);
-        assertEquals(AuthFailureReason.SESSION_UNKNOWN, reason);
+        assertEquals(AuthFailureReason.SESSION_NOT_FOUND, reason);
 
         AuthFailureReason blank = reasonOf("  ");
         log.info("[test] business=missing session id, input=validate(blank) -> {}", blank);
-        assertEquals(AuthFailureReason.SESSION_UNKNOWN, blank);
+        assertEquals(AuthFailureReason.SESSION_NOT_FOUND, blank);
+    }
+
+    @Test
+    void unknownReasonKeepsLegacyWireNameDistinctFromNewReasons() {
+        // 兼容：未知/认不出的会话必须沿用历轮取值 SESSION_NOT_FOUND，不得改名/换新值
+        assertEquals("SESSION_NOT_FOUND", AuthFailureReason.SESSION_NOT_FOUND.name());
+        // 本轮新增原因彼此不同，且与旧值并存、不顶替旧值含义
+        Set<String> wireNames = new HashSet<>(Set.of(
+                AuthFailureReason.SESSION_NOT_FOUND.name(),
+                AuthFailureReason.SESSION_LOGGED_OUT.name(),
+                AuthFailureReason.SESSION_EXPIRED.name(),
+                AuthFailureReason.SESSION_REVOKED.name()));
+        log.info("[test] business=legacy identifier compatibility, input=reason enum names -> {}"
+                + " (basis: 4 distinct wire values, legacy SESSION_NOT_FOUND retained)", wireNames);
+        assertEquals(4, wireNames.size(), "四种失效原因的线上取值必须互不相同");
     }
 
     @Test
@@ -149,7 +164,37 @@ class SessionInvalidationReasonTest {
         AuthFailureReason reason = reasonOf(id);
         log.info("[test] business=tombstone retention, input=advance 61m after logout -> {}"
                 + " (basis: tombstone purged after one session ttl)", reason);
-        assertEquals(AuthFailureReason.SESSION_UNKNOWN, reason);
+        assertEquals(AuthFailureReason.SESSION_NOT_FOUND, reason);
+    }
+
+    @Test
+    void loggedOutThenForceRevokedReportsRevoked() {
+        String id = issue("u-out-rev");
+        service.logout(id); // 先主动登出
+        service.revokeAllForUser("u-out-rev"); // 管理员随后强制失效该用户
+        AuthFailureReason reason = reasonOf(id);
+        log.info("[test] business=overlay logout+revoked, input=logout then revoke -> {}"
+                + " (basis: REVOKED has priority, tombstone upgraded)", reason);
+        assertEquals(AuthFailureReason.SESSION_REVOKED, reason);
+        // 固定可预期：再怎么重复校验/重复登出，结论不变
+        service.logout(id);
+        assertEquals(AuthFailureReason.SESSION_REVOKED, reasonOf(id));
+    }
+
+    @Test
+    void expiredSessionRevokedStaysRevokedAndCountIsZero() {
+        // 已过期又被强制失效：叠加状态稳定 REVOKED，活跃计数稳定为 0
+        String user = "u-exp-rev-count";
+        String id = issue(user);
+        clock.advance(Duration.ofMinutes(31));
+        service.revokeAllForUser(user);
+        assertEquals(0, service.activeSessionCount(user));
+        for (int i = 0; i < 10; i++) {
+            assertEquals(AuthFailureReason.SESSION_REVOKED, reasonOf(id),
+                    "过期+撤销的叠加状态重复请求必须固定为 REVOKED");
+        }
+        log.info("[test] business=overlay expired+revoked determinism, input=10x validate ->"
+                + " SESSION_REVOKED activeCount=0");
     }
 
     @Test
@@ -237,5 +282,52 @@ class SessionInvalidationReasonTest {
         assertEquals(1, trues, "并发登下同一会话，恰好一次真实登出");
         assertEquals(AuthFailureReason.SESSION_LOGGED_OUT, reasonOf(id));
         assertEquals(0, service.activeSessionCount(user));
+    }
+
+    @Test
+    void concurrentRevokeAndLogoutConvergesToStableReason() throws Exception {
+        String user = "u-race-rev";
+        int rounds = 20;
+        Set<AuthFailureReason> finals = new HashSet<>();
+        for (int round = 0; round < rounds; round++) {
+            String id = issue(user);
+            int threads = 16;
+            ExecutorService pool = Executors.newFixedThreadPool(threads);
+            CountDownLatch start = new CountDownLatch(1);
+            List<Future<?>> futures = new ArrayList<>();
+            for (int i = 0; i < threads; i++) {
+                final boolean revoke = i % 2 == 0;
+                futures.add(pool.submit(() -> {
+                    start.await();
+                    if (revoke) {
+                        service.revokeAllForUser(user);
+                    } else {
+                        service.logout(id);
+                    }
+                    return null;
+                }));
+            }
+            start.countDown();
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
+            for (Future<?> f : futures) {
+                f.get(); // 不得抛异常
+            }
+            AuthFailureReason settled = reasonOf(id);
+            finals.add(settled);
+            // 每轮无论交织顺序如何：计数为 0，原因在 {REVOKED, LOGGED_OUT} 内确定，且重复请求不变
+            assertEquals(0, service.activeSessionCount(user), "并发登出/撤销后活跃计数必须为 0");
+            assertEquals(settled, reasonOf(id), "同一输入重复请求原因必须固定");
+            assertTrue(settled == AuthFailureReason.SESSION_REVOKED
+                            || settled == AuthFailureReason.SESSION_LOGGED_OUT,
+                    "终态只能是 REVOKED 或 LOGGED_OUT，实际=" + settled);
+        }
+        log.info("[test] business=concurrent revoke+logout, input={} rounds x 16 threads -> settledReasons={}"
+                + " (basis: terminal writes linearized; revoke wins when it observed the session,"
+                + " reason never SESSION_NOT_FOUND)", rounds, finals);
+        // 撤销在各轮中都发生过，且若撤销观察到了该会话/墓碑，结论必须升级为 REVOKED；
+        // 至少在某些交织轮次中应观察到 REVOKED（证明叠加优先级在并发下生效）。
+        assertTrue(finals.contains(AuthFailureReason.SESSION_REVOKED),
+                "多轮并发中应至少有一轮撤销先生效，终态为 REVOKED，实际=" + finals);
     }
 }

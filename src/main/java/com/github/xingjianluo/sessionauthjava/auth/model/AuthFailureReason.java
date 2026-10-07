@@ -10,8 +10,13 @@ public enum AuthFailureReason {
     RATE_LIMITED,
     /** 连续失败触发账户锁定 */
     ACCOUNT_LOCKED,
-    /** 会话从未存在过，或失效记录已超过保留期被清理（未知会话） */
-    SESSION_UNKNOWN,
+    /**
+     * 会话不存在（未登录、伪造/无法识别的会话 ID，或失效记录已过保留期被清理）。
+     * 注意：沿用历轮既有的取值 SESSION_NOT_FOUND，不得改名；本轮新增的
+     * SESSION_LOGGED_OUT / SESSION_EXPIRED / SESSION_REVOKED 与本值并存、彼此不同，
+     * 不得顶替本值原来的含义。
+     */
+    SESSION_NOT_FOUND,
     /** 用户已主动登出（登出后再次使用同一会话） */
     SESSION_LOGGED_OUT,
     /** 会话已过期 */

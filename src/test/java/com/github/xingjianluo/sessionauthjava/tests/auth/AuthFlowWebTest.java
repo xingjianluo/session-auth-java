@@ -76,7 +76,7 @@ class AuthFlowWebTest {
     void protectedPathWithoutSessionIs401WithReason() throws Exception {
         MvcResult result = mockMvc.perform(get("/api/user/profile"))
                 .andExpect(status().isUnauthorized())
-                .andExpect(jsonPath("$.reason").value("SESSION_UNKNOWN"))
+                .andExpect(jsonPath("$.reason").value("SESSION_NOT_FOUND"))
                 .andExpect(header().string("X-Content-Type-Options", "nosniff"))
                 .andReturn();
         log.info("[test] input=GET /api/user/profile without session -> 401 body={}",

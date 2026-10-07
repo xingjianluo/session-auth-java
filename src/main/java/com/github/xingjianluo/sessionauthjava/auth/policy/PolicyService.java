@@ -31,13 +31,16 @@ public class PolicyService {
     static final int HISTORY_CAPACITY = 64;
 
     private final AtomicReference<AuthPolicy> current;
-    /** version -> 快照；访问序 LinkedHashMap，容量受控 */
+    /**
+     * version -> 快照；必须用<b>插入序</b>（accessOrder=false）：淘汰只按版本新旧，
+     * 回放时的 {@link #version(long)} 读取不能把老版本"刷新"成最近使用而导致它永不淘汰。
+     */
     private final Map<Long, AuthPolicy> history;
 
     public PolicyService(AuthSecurityProperties properties) {
         AuthPolicy initial = AuthPolicy.snapshot(1, properties);
         this.current = new AtomicReference<>(initial);
-        this.history = new LinkedHashMap<>(16, 0.75f, true) {
+        this.history = new LinkedHashMap<>() {
             @Override
             protected boolean removeEldestEntry(Map.Entry<Long, AuthPolicy> eldest) {
                 return size() > HISTORY_CAPACITY;
@@ -71,6 +74,13 @@ public class PolicyService {
     public Optional<AuthPolicy> version(long version) {
         synchronized (this) {
             return Optional.ofNullable(history.get(version));
+        }
+    }
+
+    /** 当前仍保留（可回放）的策略版本号列表，按版本升序。 */
+    public java.util.List<Long> versions() {
+        synchronized (this) {
+            return history.keySet().stream().sorted().toList();
         }
     }
 

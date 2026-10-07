@@ -119,6 +119,23 @@ public class DecisionLog {
         return records.size();
     }
 
+    /** 按 ID 取判定记录（供运维 HTTP 入口查看/回放）；已被淘汰返回空。 */
+    public Optional<DecisionRecord> get(long decisionId) {
+        synchronized (this) {
+            return Optional.ofNullable(records.get(decisionId));
+        }
+    }
+
+    /** 按插入顺序（旧 -> 新）返回当前保留的全部判定记录快照。 */
+    public java.util.List<DecisionRecord> snapshot() {
+        synchronized (this) {
+            return insertionOrder.stream()
+                    .map(records::get)
+                    .filter(java.util.Objects::nonNull)
+                    .toList();
+        }
+    }
+
     /** 取某类判定中最新的一条（测试与排障观测用）。 */
     public Optional<DecisionRecord> latestOfKind(String kind) {
         synchronized (this) {
